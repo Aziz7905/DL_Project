@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic>=2
+
+# LangChain core + community integrations
+langchain
+langchain-core
+langchain-community
+langchain-huggingface
+
+# Vector store + loaders
+faiss-cpu
+pypdf
+unstructured
+python-magic-bin
+
+# LLM clients
+groq
+markdown
+
+# (Optional) web search
+google-search-results  # SerpAPI python client
+
+# For typing on Python <3.11 (if needed)
+typing_extensions

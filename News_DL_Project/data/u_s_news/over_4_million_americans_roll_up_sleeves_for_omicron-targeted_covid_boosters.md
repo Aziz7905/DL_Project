@@ -1,0 +1,10 @@
+# Over 4 Million Americans Roll Up Sleeves For Omicron-Targeted COVID Boosters
+
+Health experts said it is too early to predict whether demand would match up with the 171 million doses of the new boosters the U.S. ordered for the fall.
+
+---
+category: U.S. NEWS
+authors: Carla K. Johnson, AP
+date: 2022-09-23
+link: https://www.huffpost.com/entry/covid-boosters-uptake-us_n_632d719ee4b087fae6feaac9
+---
