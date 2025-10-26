@@ -8,6 +8,7 @@ langchain
 langchain-core
 langchain-community
 langchain-huggingface
+langchain-text-splitters
 
 # Vector store + loaders
 faiss-cpu
@@ -19,8 +20,29 @@ python-magic-bin
 groq
 markdown
 
-# (Optional) web search
+# Web search / utilities
 google-search-results  # SerpAPI python client
+beautifulsoup4  # bs4 used in orchestrator for HTML parsing
+
+# Other runtime deps often used by the codebase
+numpy
+requests
+pydantic-settings
+httpx
+aiohttp
+huggingface-hub
+transformers  # optional: required for local HF models (heavy)
 
 # For typing on Python <3.11 (if needed)
 typing_extensions
+
+# Optional: lock file generation note
+# To create a reproducible env, run: pip freeze > requirements-lock.txt
+
+# Notes:
+# - 'transformers' and some HF local embeddings require 'torch' or 'flax' depending on model; install
+#   only if you plan to run local models (e.g. pip install torch --index-url https://download.pytorch.org/whl/cu118)
+# - 'httpx' and 'aiohttp' are included because many langchain-community integrations require them.
+streamlit requests
+rank_bm25 langchain-huggingface
+langchain langchain-community sentence-transformers faiss-cpu

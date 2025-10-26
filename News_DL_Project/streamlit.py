@@ -1,254 +1,167 @@
-# app.py
 import os
 import json
 import requests
 import streamlit as st
-from html import escape
 from urllib.parse import urljoin
+from html import escape
 
-st.set_page_config(page_title="News QA & Verification", page_icon="📰", layout="wide")
+st.set_page_config(page_title="📰 News Analyzer", layout="wide")
 
-# ---------------------------
-# Config
-# ---------------------------
 API_URL = os.getenv("ANALYZER_API_URL", "http://127.0.0.1:8000")
 ANALYZE_ENDPOINT = "/api/analyze"
-RL_ENDPOINT = "/api/rl-feedback"
+RL_ENDPOINT = "/api/feedback"
 
-# ---------------------------
-# Sidebar controls
-# ---------------------------
-st.sidebar.title("⚙️ Settings")
-session_id = st.sidebar.text_input("Session ID", value="demo_session_001")
-use_reformulation = st.sidebar.checkbox("Use reformulation", value=True)
-do_claims = st.sidebar.checkbox("Extract claims", value=True)
-verify_source_score = st.sidebar.checkbox("Score sources", value=True)
-use_web = st.sidebar.checkbox("Use web for verification", value=True)
-do_explain_scores = st.sidebar.checkbox("Explain scores", value=True)
-k_retrieval = st.sidebar.slider("k_retrieval", 1, 12, 6)
-k_ltm = st.sidebar.slider("k_ltm", 0, 6, 3)
-max_claims = st.sidebar.slider("max_claims", 1, 10, 4)
+# Default session
+if "session_id" not in st.session_state:
+    st.session_state.session_id = "demo"
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"POST → {API_URL}{ANALYZE_ENDPOINT}")
+st.title("📰 News Credibility Assistant")
 
-# ---------------------------
-# Main inputs
-# ---------------------------
-st.title("📰 Simple News Chat (QA + Claims + Verification)")
-
-col1, col2 = st.columns(2)
-with col1:
-    question = st.text_input(
-        "Question",
-        value="What new products is Apple expected to announce at the event?"
-    )
-with col2:
-    st.write("")  # spacing
-
+# ------------------- Inputs -------------------
+question = st.text_input("User Question", value="What new products is Apple expected to announce?")
 article = st.text_area(
-    "Article / Snippet (optional but recommended)",
-    height=180,
-    value=(
-        "Apple announced that it will hold a major launch event next month in Cupertino. "
-        "Analysts expect the company to unveil new MacBook models featuring its latest M3 chip architecture. "
-        "Apple is also anticipated to expand availability of the Vision Pro mixed-reality headset "
-        "to additional countries in Europe and Asia."
-    )
+    "Paste a news snippet (optional)",
+    height=160,
+    value="Apple will hold a launch event next month in Cupertino featuring new M3 devices."
 )
 
-run_btn = st.button("Analyze 🔎", type="primary")
+colA, colB, colC = st.columns(3)
+use_web = colA.checkbox("🌍 Web verification", value=True)
+use_reformulation = colB.checkbox("🔁 Reformulate", value=True)
+do_explain_scores = colC.checkbox("ℹ Explain scoring", value=False)
 
-# Keep last answer for RL feedback
-if "last_answer_html" not in st.session_state:
-    st.session_state.last_answer_html = ""
-if "last_question" not in st.session_state:
-    st.session_state.last_question = ""
-if "last_session_id" not in st.session_state:
-    st.session_state.last_session_id = session_id
+analyze_btn = st.button("Analyze 🔎")
 
-# ---------------------------
-# Call API
-# ---------------------------
-if run_btn:
+# =================== Call API ===================
+if analyze_btn:
     payload = {
         "question": question or None,
         "article": article or None,
-        "session_id": session_id or None,
-        "use_reformulation": use_reformulation,
-        "do_claims": do_claims,
-        "verify_source_score": verify_source_score,
+        "session_id": st.session_state.session_id,
         "use_web": use_web,
+        "use_reformulation": use_reformulation,
         "do_explain_scores": do_explain_scores,
-        "k_retrieval": int(k_retrieval),
-        "k_ltm": int(k_ltm),
-        "max_claims": int(max_claims),
+        # let backend defaults handle other knobs
     }
-
     try:
-        url = urljoin(API_URL, ANALYZE_ENDPOINT)
-        resp = requests.post(url, json=payload, timeout=45)
+        resp = requests.post(urljoin(API_URL, ANALYZE_ENDPOINT), json=payload, timeout=90)
+        resp.raise_for_status()
     except Exception as e:
-        st.error(f"Request error: {e}")
+        st.error(f"❌ API connection failed: {e}")
         st.stop()
 
-    if resp.status_code != 200:
-        st.error(f"API error {resp.status_code}: {resp.text[:800]}")
-        st.stop()
+    result = resp.json()
 
-    try:
-        data = resp.json()
-    except Exception:
-        st.error("Failed to parse JSON response.")
-        st.text(resp.text[:1000])
-        st.stop()
-
-    # ---------------------------
-    # Render Answer
-    # ---------------------------
-    st.subheader("Answer")
-    ans = data.get("answer") or {}
-    ans_html = ans.get("html") or "<p><em>No answer.</em></p>"
-
-    # store for RL feedback
-    st.session_state.last_answer_html = ans_html
+    # Store for RL
     st.session_state.last_question = question
-    st.session_state.last_session_id = session_id
+    st.session_state.last_answer_html = result.get("answer", {}).get("html", "")
 
-    try:
-        import streamlit.components.v1 as components
-        components.html(
-            f"<div style='font-family:system-ui,Segoe UI,Arial,sans-serif'>{ans_html}</div>",
-            height=300,
-            scrolling=True
-        )
-    except Exception:
-        st.markdown(ans_html, unsafe_allow_html=True)
+    # ------------------- Answer -------------------
+    st.subheader("💬 Answer")
+    st.markdown(result.get("answer", {}).get("html", ""), unsafe_allow_html=True)
 
-    meta = data.get("meta", {})
-    timings = (meta.get("timings") or {})
-    with st.expander("Latency & Knobs"):
-        st.json({
-            "latency_s": ans.get("latency_s"),
-            "timings": timings,
-            "knobs": meta.get("knobs")
-        })
+    # ------------------- Reformulation -------------------
+    ref = result.get("meta", {}).get("reformulation", {})
+    if ref.get("used"):
+        with st.expander("🔁 Reformulation"):
+            st.markdown(f"**Before:** `{ref.get('before') or ''}`")
+            st.markdown(f"**After:** `{ref.get('after') or ''}`")
+            kqs = ref.get("keyword_queries") or []
+            doms = ref.get("preferred_domains") or []
+            if kqs:
+                st.markdown("**Keyword queries:**")
+                for q in kqs:
+                    st.code(q)
+            if doms:
+                st.markdown("**Preferred domains:** " + ", ".join(doms))
 
-    # ---------------------------
-    # Claims
-    # ---------------------------
-    if do_claims:
-        st.subheader("Extracted Claims")
-        claims = data.get("claims") or []
-        if not claims:
-            st.info("No claims extracted.")
-        else:
-            for i, c in enumerate(claims, 1):
-                st.write(f"**{i}.** {c}")
+    # ------------------- Memory -------------------
+    mem = result.get("meta", {}).get("memory", {})
+    with st.expander("🧠 Memory"):
+        st.markdown("**Short-Term Memory**")
+        st.text(mem.get("stm") or "—")
+        st.markdown("**Long-Term Retrieved Memory**")
+        st.text(mem.get("ltm") or "—")
 
-    # ---------------------------
-    # Verification
-    # ---------------------------
-    verifs = data.get("verification") or []
-    st.subheader("Verification")
-    if not verifs:
-        st.info("No verification results.")
-    else:
-        for i, v in enumerate(verifs, 1):
-            verdict = v.get("verdict") or "unrelated"
-            ss = v.get("support_score")
-            sc = v.get("source_score")
-            fs = v.get("final_score")
+    # ------------------- Claims & Verification -------------------
+    claims = result.get("claims", [])
+    verifs = result.get("verification", [])
+    if claims:
+        st.subheader("🧩 Extracted Claims & Verification")
+        for i, (cl, chk) in enumerate(zip(claims, verifs), start=1):
+            badge = {"support": "✅", "contradict": "❌", "unrelated": "⚪"}.get(chk.get("verdict"), "⚪")
+            st.markdown(f"**{i}. {badge} {cl}**")
 
-            badge = {"support": "✅", "contradict": "❌", "unrelated": "⚪"}.get(verdict, "⚪")
-            st.markdown(f"**{i}. {badge} {verdict.capitalize()}** — *{escape(v.get('claim',''))}*")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Support", chk.get("support_score"))
+            c2.metric("Source", chk.get("source_score"))
+            c3.metric("Final", chk.get("final_score"))
 
-            cols = st.columns(3)
-            cols[0].metric("Support", f"{ss if ss is not None else '-'}")
-            cols[1].metric("Source prior", f"{sc if sc is not None else '-'}")
-            cols[2].metric("Final", f"{fs if fs is not None else '-'}")
+            if chk.get("explanation"):
+                st.caption(chk["explanation"])
 
-            expl = v.get("explanation")
-            if expl:
-                st.caption(expl)
+            evid = chk.get("evidence", {})
+            with st.expander("🧾 Evidence"):
+                # Local evidence with filenames
+                loc_snips = evid.get("local_snippets", [])
+                loc_srcs = evid.get("local_sources", [])
+                if loc_snips:
+                    st.markdown("**📍 Local Evidence**")
+                    for sn, src in zip(loc_snips, loc_srcs):
+                        st.write(f"- *{src}* — {escape(sn[:250])}…")
 
-            ev = v.get("evidence") or {}
-            with st.expander("Evidence"):
-                ls = ev.get("local_snippets") or []
-                if ls:
-                    st.markdown("**Local snippets**")
-                    for s in ls:
-                        st.write(f"- {s[:400]}{'…' if len(s)>400 else ''}")
-
-                ws = ev.get("web_snippets") or []
-                wl = ev.get("web_links") or []
-                if ws or wl:
-                    st.markdown("**Web**")
-                    for idx, (s, link) in enumerate(zip(ws, wl)):
-                        st.write(f"- {s[:400]}{'…' if len(s)>400 else ''}")
+                # Web evidence with links
+                web_snips = evid.get("web_snippets", [])
+                web_links = evid.get("web_links", [])
+                if web_snips:
+                    st.markdown("**🌍 Web Evidence**")
+                    for sn, link in zip(web_snips, web_links):
+                        st.write(f"- {escape(sn[:220])}…")
                         if link:
                             st.markdown(f"  ↪️ [{link}]({link})")
 
-            st.divider()
+    # ------------------- Timings & Raw -------------------
+    with st.expander("⏱ Latency & Knobs"):
+        st.json(result.get("meta", {}))
 
-    # ---------------------------
-    # Raw JSON (debug)
-    # ---------------------------
-    with st.expander("Raw JSON response"):
-        st.code(json.dumps(data, indent=2)[:100000], language="json")
+    with st.expander("🛠 Raw Response JSON"):
+        st.json(result)
 
-else:
-    st.info("Enter a question and optional article, then click **Analyze**.")
-
-# ===========================
-# RL FEEDBACK (Thumbs)
-# ===========================
+# =================== RL Feedback ===================
 st.markdown("---")
-st.subheader("Feedback (RL)")
+st.subheader("Reward this response")
 
-col_up, col_down = st.columns(2)
-with col_up:
-    if st.button("👍 Good Answer"):
+cols = st.columns(2)
+with cols[0]:
+    if st.button("👍 Helpful"):
         if not st.session_state.last_answer_html:
-            st.warning("Run an analysis first.")
+            st.warning("Run analysis first.")
         else:
             try:
-                url = urljoin(API_URL, RL_ENDPOINT)
-                payload = {
-                    "session_id": st.session_state.last_session_id,
+                requests.post(urljoin(API_URL, RL_ENDPOINT), json={
+                    "session_id": st.session_state.session_id,
                     "question": st.session_state.last_question,
                     "answer_html": st.session_state.last_answer_html,
                     "reward": 1,
-                    "verdict": "good",
-                    "meta": {}
-                }
-                r = requests.post(url, json=payload, timeout=15)
-                if r.status_code == 200:
-                    st.success("✅ Feedback recorded.")
-                else:
-                    st.error(f"RL API error {r.status_code}: {r.text[:300]}")
+                    "verdict": "good"
+                }, timeout=15)
+                st.success("✅ Thanks! Reward logged.")
             except Exception as e:
-                st.error(f"RL request failed: {e}")
+                st.error(f"RL error: {e}")
 
-with col_down:
-    if st.button("👎 Bad Answer"):
+with cols[1]:
+    if st.button("👎 Not Helpful"):
         if not st.session_state.last_answer_html:
-            st.warning("Run an analysis first.")
+            st.warning("Run analysis first.")
         else:
             try:
-                url = urljoin(API_URL, RL_ENDPOINT)
-                payload = {
-                    "session_id": st.session_state.last_session_id,
+                requests.post(urljoin(API_URL, RL_ENDPOINT), json={
+                    "session_id": st.session_state.session_id,
                     "question": st.session_state.last_question,
                     "answer_html": st.session_state.last_answer_html,
                     "reward": -1,
-                    "verdict": "bad",
-                    "meta": {}
-                }
-                r = requests.post(url, json=payload, timeout=15)
-                if r.status_code == 200:
-                    st.info("⚠️ Negative feedback recorded.")
-                else:
-                    st.error(f"RL API error {r.status_code}: {r.text[:300]}")
+                    "verdict": "bad"
+                }, timeout=15)
+                st.error("⚠️ Feedback recorded.")
             except Exception as e:
-                st.error(f"RL request failed: {e}")
+                st.error(f"RL error: {e}")

@@ -3,9 +3,14 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import os, time
 from markdown import markdown
+from bs4 import BeautifulSoup
 from langchain_core.messages import HumanMessage
 
-from app.agents.qa_chain import _retriever as QA_RETRIEVER, _llm as QA_LLM, _prompt as QA_PROMPT
+from app.agents.qa_chain import (
+    _retriever as QA_RETRIEVER,
+    _llm as QA_LLM,
+    _prompt as QA_PROMPT,
+)
 from app.agents.qa_chain import _build_context as qa_build_context
 from app.agents.claim_extractor import ClaimExtractorAgent
 from app.agents.cross_verifier import CrossVerifierAgent
@@ -13,23 +18,29 @@ from app.agents.evidence_retriever import EvidenceRetrieverAgent
 from app.agents.query_reformulator import QueryReformulatorAgent
 from app.agents.source_scorer import SourceScorerAgent
 from app.agents.aggregator import AggregatorAgent
-from app.agents.web_retriever import WebRetrieverAgent  # optional
+from app.agents.web_retriever import WebRetrieverAgent
 from app.memory.langchain_memory import memory
+
 
 class OrchestratorAgent:
     def __init__(self):
+        # wires for QA
         self.retriever = QA_RETRIEVER
         self.qa_llm = QA_LLM
         self.qa_prompt = QA_PROMPT
 
+        # lazy sub-agents
         self._claim_extractor = None
         self._cross_verifier = None
         self._query_reformulator = None
+        self._web_agent = None
+
+        # always-available utilities
         self._evidence_agent = EvidenceRetrieverAgent()
         self._source_scorer = SourceScorerAgent()
         self._aggregator = AggregatorAgent()
-        self._web_agent = None
 
+    # ------------------------ Lazy inits ------------------------
     def _get_claim_extractor(self):
         if self._claim_extractor is None:
             self._claim_extractor = ClaimExtractorAgent()
@@ -50,68 +61,51 @@ class OrchestratorAgent:
             self._web_agent = WebRetrieverAgent()
         return self._web_agent
 
+    # =======================================================================
+    # QA
+    # =======================================================================
     def _run_qa(
         self,
         question: str,
         session_id: Optional[str],
         k_retrieval: int,
         k_ltm: int,
-        article_text: Optional[str] = None,   # ← added: prime with article text
-    ):
+        article_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
         t0 = time.time()
 
-        # 0) Prime with article headline/description (HuffPost-style)
-        prime = (article_text or "").strip()
-        prime_block = f"[HEADLINE+DESCRIPTION]\n{prime}\n" if prime else ""
-
-        # 1) memory
-        stm_text = memory.stm_to_text(session_id)
+        # Memory recall
+        stm = memory.stm_to_text(session_id)
         ltm_docs = memory.ltm_recall(session_id, question, k=k_ltm)
-        ltm_texts = [f"[LTM:{d.metadata.get('kind','note')}] {d.page_content}" for d in ltm_docs]
-        ltm_block = "\n".join(ltm_texts).strip()
-        history = "\n\n".join([b for b in [stm_text, ltm_block] if b]).strip()
+        ltm_txt = "\n".join([d.page_content for d in ltm_docs]).strip()
+        history = "\n\n".join(x for x in [stm, ltm_txt] if x)
 
-        # 2) retrieval & context
+        # Retrieval → context
         ctx, docs = qa_build_context(question, history, k=k_retrieval)
-        # Prepend the prime block if present
-        ctx = "\n\n====\n\n".join([b for b in [prime_block, ctx] if b]).strip()
 
+        # Prompt + LLM
         filled = self.qa_prompt.format(context=ctx, question=question)
+        result_text = self.qa_llm.invoke([HumanMessage(content=filled)]).content.strip()
 
-        # 3) ask the LLM (news-friendly QA)
-        result = self.qa_llm.invoke([HumanMessage(content=filled)]).content.strip()
+        # HTML
+        html = markdown(result_text, extensions=["fenced_code", "tables", "nl2br"])
 
-        # 4) sources
-        sources = []
-        if docs:
-            labels = []
-            for d in docs:
-                meta = d.metadata or {}
-                src = meta.get("source") or meta.get("file_path") or "unknown"
-                page = meta.get("page")
-                label = os.path.basename(str(src))
-                if page is not None:
-                    label += f", p.{page}"
-                labels.append(label)
-            sources = sorted(set(labels))
-            if sources:
-                result += "\n\n📚 **Sources** : " + ", ".join(sources)
-
-        html = markdown(result, extensions=["fenced_code", "tables", "nl2br"])
-
-        # 5) memory write
+        # Memory write
         if session_id:
-            memory.stm_add_turn(session_id, user_text=question, assistant_text=result)
-            answer_only = result.split("\n\n📚 **Sources**")[0]
-            memory.ltm_add(session_id, text=question, kind="user_q")
-            memory.ltm_add(session_id, text=answer_only[:500], kind="assistant_a")
+            memory.stm_add_turn(session_id, question, result_text.split("\n\n📚")[0])
+            memory.ltm_add(session_id, question, kind="user_q")
+            memory.ltm_add(session_id, result_text[:500], kind="assistant_a")
 
-        t1 = time.time()
-        return {"html": html, "sources": sources, "latency_s": round(t1 - t0, 3)}
+        return {
+            "html": html,
+            "raw": result_text,
+            "docs": docs,
+            "latency_s": round(time.time() - t0, 3),
+        }
 
-    def _extract_claims(self, text: str, max_claims: int) -> List[str]:
-        return self._get_claim_extractor().extract_claims(text, max_claims=max_claims)
-
+    # =======================================================================
+    # Verification
+    # =======================================================================
     def _verify_claim(
         self,
         claim: str,
@@ -119,6 +113,7 @@ class OrchestratorAgent:
         verify_source_score: bool,
         do_explain_scores: bool,
     ) -> Dict[str, Any]:
+
         # Local evidence
         local_docs = self._evidence_agent.get_evidence(claim, max_docs=3)
         local_snips = [d.page_content for d in local_docs]
@@ -132,39 +127,31 @@ class OrchestratorAgent:
                 name += f", p.{page}"
             local_sources.append(name)
 
-        # Optional web evidence
+        # Web evidence
         web_snips, web_links = [], []
         if use_web:
             try:
-                war = self._get_web_agent().get_live_evidence(claim)[:3]
-                for r in war:
-                    title = (r.get("title") or "").strip()
-                    snippet = (r.get("snippet") or "").strip()
+                results = self._get_web_agent().get_live_evidence(claim)[:3]
+                for r in results:
+                    snip = (r.get("snippet") or r.get("title") or "").strip()
                     link = r.get("link") or r.get("url")
-                    # Prefer snippet; fall back to title if snippet missing
-                    if snippet or title:
-                        web_snips.append(snippet if snippet else title)
-                        if link:
-                            web_links.append(link)
+                    if snip:
+                        web_snips.append(snip)
+                    if link:
+                        web_links.append(link)
             except Exception:
                 pass
 
-        # Compose evidence for verifier (local preferred)
+        # Compose evidence text for verifier
         evidence_text = "\n\n---\n\n".join(local_snips + web_snips)[:4000] or "."
-
-        # Cross verification label
         verdict = self._get_cross_verifier().verify_claim(claim, evidence_text)
 
-        # Source scoring prior
+        # Source prior
         src_score = None
         if verify_source_score:
-            src_score = 2.5
-            for s in local_sources:
-                score = self._source_scorer.score_source(None, s)
-                if score > src_score:
-                    src_score = score
+            src_score = max([2.5] + [self._source_scorer.score_source(None, s) for s in local_sources])
 
-        # Heuristic support score mapped to 1..5 scale (softer neutral)
+        # Heuristic support score
         support_score = 4.3 if verdict == "support" else 1.7 if verdict == "contradict" else 3.0
 
         final_score = None
@@ -172,29 +159,28 @@ class OrchestratorAgent:
         if verify_source_score:
             final_score = self._aggregator.aggregate(support_score, src_score or 2.5, verdict)
             if do_explain_scores:
-                explanation = self._aggregator.explain(
-                    claim=claim,
-                    support_score=support_score,
-                    source_score=src_score or 2.5,
-                    cross_verification=verdict,
-                    final_score=final_score,
+                explanation = (
+                    f"support={support_score}, source={src_score}, verdict={verdict} → final={final_score}"
                 )
 
         return {
             "claim": claim,
-            "verdict": verdict,  # support | contradict | unrelated
+            "verdict": verdict,
             "support_score": support_score,
             "source_score": src_score,
             "final_score": final_score,
             "explanation": explanation,
             "evidence": {
                 "local_snippets": local_snips,
-                "local_sources": list(sorted(set(local_sources))),
+                "local_sources": list(dict.fromkeys(local_sources)),
                 "web_snippets": web_snips if use_web else [],
                 "web_links": web_links if use_web else [],
             },
         }
 
+    # =======================================================================
+    # Orchestration (signature matches routes + streamlit)
+    # =======================================================================
     def analyze(
         self,
         question: Optional[str],
@@ -211,58 +197,54 @@ class OrchestratorAgent:
         max_claims: int = 5,
     ) -> Dict[str, Any]:
 
-        timings = {}
+        timings: Dict[str, float] = {}
         t_all = time.time()
 
-        # Derive working question
-        working_question = (question or "").strip()
-        if not working_question and article:
-            working_question = article.strip().split("\n")[0][:200]
+        # Working question (fallback to article headline)
+        working_q = (question or "").strip()
+        if not working_q and article:
+            working_q = article.strip().split("\n")[0][:200]
 
-        # Optional query reformulation
-        plan = None
-        if use_reformulation and working_question:
+        # ---------------- Reformulation ----------------
+        plan = None               # will hold dict from QueryReformulatorAgent
+        reform_after = working_q  # text used for QA
+        if use_reformulation and reform_after:
             t0 = time.time()
             try:
-                plan = self._get_reformulator().reformulate(working_question)
+                plan_dict = self._get_reformulator().reformulate(reform_after)
+                if isinstance(plan_dict, dict):
+                    plan = plan_dict
+                    # Prefer the semantic paraphrase for QA
+                    sa = (plan_dict.get("semantic_query") or "").strip()
+                    if sa:
+                        reform_after = sa
             except Exception:
                 plan = None
             timings["reformulation_s"] = round(time.time() - t0, 3)
 
-        # QA
-        answer = None
-        if working_question:
-            t0 = time.time()
-            answer = self._run_qa(
-                working_question,
-                session_id,
-                k_retrieval=k_retrieval,
-                k_ltm=k_ltm,
-                article_text=article,  # ← pass article to prime QA
-            )
-            timings["qa_s"] = round(time.time() - t0, 3)
+        # ---------------- QA ----------------
+        t0 = time.time()
+        answer = self._run_qa(reform_after or working_q, session_id, k_retrieval, k_ltm, article)
+        timings["qa_s"] = round(time.time() - t0, 3)
 
-        # Claims + Verification
+        # ---------------- Claims + Verification ----------------
         claims: List[str] = []
         verification: List[Dict[str, Any]] = []
         if do_claims:
-            source_text = (article or "")
-            if not source_text and answer:
-                # strip HTML to text (before sources)
+            source_text = (article or "").strip()
+            if not source_text:
                 try:
-                    from bs4 import BeautifulSoup
                     soup = BeautifulSoup(answer["html"], "html.parser")
-                    text = soup.get_text("\n")
-                    source_text = text.split("📚 **Sources**")[0]
+                    source_text = (soup.get_text("\n") or "").strip()
                 except Exception:
                     source_text = ""
 
-            if source_text.strip():
+            if source_text:
                 t0 = time.time()
-                claims = self._extract_claims(source_text, max_claims=max_claims)
+                claims = self._get_claim_extractor().extract_claims(source_text, max_claims=max_claims)
                 timings["claims_s"] = round(time.time() - t0, 3)
 
-                t1 = time.time()
+                t0 = time.time()
                 for c in claims:
                     verification.append(
                         self._verify_claim(
@@ -272,26 +254,43 @@ class OrchestratorAgent:
                             do_explain_scores=do_explain_scores,
                         )
                     )
-                timings["verification_s"] = round(time.time() - t1, 3)
+                timings["verification_s"] = round(time.time() - t0, 3)
 
         timings["total_s"] = round(time.time() - t_all, 3)
 
+        # ---------------- Meta for UI ----------------
+        meta: Dict[str, Any] = {
+            "memory": {
+                "stm": memory.stm_to_text(session_id),
+                "ltm": "\n".join(
+                    [d.page_content for d in memory.ltm_recall(session_id, reform_after or working_q, k=k_ltm)]
+                ),
+            },
+            "timings": timings,
+            "reformulation": {
+                "used": bool(use_reformulation),
+                "before": question,
+                "after": reform_after,
+                "keyword_queries": (plan or {}).get("keyword_queries") if isinstance(plan, dict) else None,
+                "preferred_domains": (plan or {}).get("preferred_domains") if isinstance(plan, dict) else None,
+            },
+            "web_used": bool(use_web),
+            "knobs": {
+                "use_reformulation": use_reformulation,
+                "do_claims": do_claims,
+                "verify_source_score": verify_source_score,
+                "use_web": use_web,
+                "do_explain_scores": do_explain_scores,
+                "k_retrieval": k_retrieval,
+                "k_ltm": k_ltm,
+                "max_claims": max_claims,
+            },
+        }
+
         return {
-            "answer": answer,
+            "answer": {"html": answer["html"], "latency_s": answer["latency_s"]},
             "claims": claims,
             "verification": verification,
-            "plan": plan,
-            "meta": {
-                "timings": timings,
-                "knobs": {
-                    "use_reformulation": use_reformulation,
-                    "do_claims": do_claims,
-                    "verify_source_score": verify_source_score,
-                    "use_web": use_web,
-                    "do_explain_scores": do_explain_scores,
-                    "k_retrieval": k_retrieval,
-                    "k_ltm": k_ltm,
-                    "max_claims": max_claims,
-                },
-            },
+            "plan": plan,  # keep the full dict available
+            "meta": meta,
         }
