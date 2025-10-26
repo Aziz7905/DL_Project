@@ -1,4 +1,6 @@
-# app/agents/orchestrator.py
+# COMPLETE FIX for orchestrator.py
+# This preserves both original and reformulated queries
+
 from __future__ import annotations
 from typing import Dict, Any, List, Optional
 import os, time
@@ -62,7 +64,7 @@ class OrchestratorAgent:
         return self._web_agent
 
     # =======================================================================
-    # QA
+    # QA - FIXED to handle both original and reformulated queries
     # =======================================================================
     def _run_qa(
         self,
@@ -71,17 +73,25 @@ class OrchestratorAgent:
         k_retrieval: int,
         k_ltm: int,
         article_text: Optional[str] = None,
+        original_question: Optional[str] = None,  # ← NEW parameter
     ) -> Dict[str, Any]:
         t0 = time.time()
 
-        # Memory recall
+        # Use original question for memory operations if provided
+        memory_question = original_question or question
+
+        # Memory recall - use ORIGINAL question for better matching
         stm = memory.stm_to_text(session_id)
-        ltm_docs = memory.ltm_recall(session_id, question, k=k_ltm)
+        ltm_docs = memory.ltm_recall(session_id, memory_question, k=k_ltm)
         ltm_txt = "\n".join([d.page_content for d in ltm_docs]).strip()
         history = "\n\n".join(x for x in [stm, ltm_txt] if x)
 
-        # Retrieval → context
+        # Retrieval → context (use reformulated question for better retrieval)
         ctx, docs = qa_build_context(question, history, k=k_retrieval)
+
+        # ENSURE history is in context
+        if history and "CONVERSATION HISTORY" not in ctx and "conversation" not in ctx.lower()[:200]:
+            ctx = f"CONVERSATION HISTORY:\n{history}\n\n{'='*50}\n\nRETRIEVED DOCUMENTS:\n{ctx}"
 
         # Prompt + LLM
         filled = self.qa_prompt.format(context=ctx, question=question)
@@ -90,10 +100,10 @@ class OrchestratorAgent:
         # HTML
         html = markdown(result_text, extensions=["fenced_code", "tables", "nl2br"])
 
-        # Memory write
+        # Memory write - use ORIGINAL question
         if session_id:
-            memory.stm_add_turn(session_id, question, result_text.split("\n\n📚")[0])
-            memory.ltm_add(session_id, question, kind="user_q")
+            memory.stm_add_turn(session_id, memory_question, result_text.split("\n\n📚")[0])
+            memory.ltm_add(session_id, memory_question, kind="user_q")
             memory.ltm_add(session_id, result_text[:500], kind="assistant_a")
 
         return {
@@ -104,7 +114,7 @@ class OrchestratorAgent:
         }
 
     # =======================================================================
-    # Verification
+    # Verification (unchanged)
     # =======================================================================
     def _verify_claim(
         self,
@@ -179,7 +189,7 @@ class OrchestratorAgent:
         }
 
     # =======================================================================
-    # Orchestration (signature matches routes + streamlit)
+    # Orchestration - FIXED to preserve original question
     # =======================================================================
     def analyze(
         self,
@@ -205,26 +215,36 @@ class OrchestratorAgent:
         if not working_q and article:
             working_q = article.strip().split("\n")[0][:200]
 
+        # Keep original for memory operations
+        original_q = working_q
+
         # ---------------- Reformulation ----------------
-        plan = None               # will hold dict from QueryReformulatorAgent
-        reform_after = working_q  # text used for QA
+        plan = None
+        reform_after = working_q  # This will be used for retrieval
         if use_reformulation and reform_after:
             t0 = time.time()
             try:
                 plan_dict = self._get_reformulator().reformulate(reform_after)
                 if isinstance(plan_dict, dict):
                     plan = plan_dict
-                    # Prefer the semantic paraphrase for QA
+                    # Prefer the semantic paraphrase for QA/retrieval
                     sa = (plan_dict.get("semantic_query") or "").strip()
                     if sa:
-                        reform_after = sa
+                        reform_after = sa  # Only used for retrieval, NOT memory
             except Exception:
                 plan = None
             timings["reformulation_s"] = round(time.time() - t0, 3)
 
-        # ---------------- QA ----------------
+        # ---------------- QA - pass BOTH queries ----------------
         t0 = time.time()
-        answer = self._run_qa(reform_after or working_q, session_id, k_retrieval, k_ltm, article)
+        answer = self._run_qa(
+            reform_after or working_q,  # For retrieval
+            session_id,
+            k_retrieval,
+            k_ltm,
+            article,
+            original_question=original_q  # For memory operations
+        )
         timings["qa_s"] = round(time.time() - t0, 3)
 
         # ---------------- Claims + Verification ----------------
@@ -263,13 +283,13 @@ class OrchestratorAgent:
             "memory": {
                 "stm": memory.stm_to_text(session_id),
                 "ltm": "\n".join(
-                    [d.page_content for d in memory.ltm_recall(session_id, reform_after or working_q, k=k_ltm)]
+                    [d.page_content for d in memory.ltm_recall(session_id, original_q, k=k_ltm)]
                 ),
             },
             "timings": timings,
             "reformulation": {
                 "used": bool(use_reformulation),
-                "before": question,
+                "before": original_q,  # ← Show ORIGINAL question
                 "after": reform_after,
                 "keyword_queries": (plan or {}).get("keyword_queries") if isinstance(plan, dict) else None,
                 "preferred_domains": (plan or {}).get("preferred_domains") if isinstance(plan, dict) else None,
@@ -291,6 +311,6 @@ class OrchestratorAgent:
             "answer": {"html": answer["html"], "latency_s": answer["latency_s"]},
             "claims": claims,
             "verification": verification,
-            "plan": plan,  # keep the full dict available
+            "plan": plan,
             "meta": meta,
         }
